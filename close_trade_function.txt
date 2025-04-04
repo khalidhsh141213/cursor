@@ -1,0 +1,165 @@
+                                                                          pg_get_functiondef                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CREATE OR REPLACE FUNCTION public.close_trade_with_wallet(p_trade_id integer, p_close_price numeric, p_closed_by character varying DEFAULT 'user'::character varying)+
+  RETURNS json                                                                                                                                                        +
+  LANGUAGE plpgsql                                                                                                                                                    +
+ AS $function$                                                                                                                                                        +
+ DECLARE                                                                                                                                                              +
+   v_trade RECORD;                                                                                                                                                    +
+   v_wallet_id INTEGER;                                                                                                                                               +
+   v_available_balance DECIMAL(20, 8);                                                                                                                                +
+   v_locked_amount DECIMAL(20, 8);                                                                                                                                    +
+   v_profit_loss DECIMAL(20, 8);                                                                                                                                      +
+   v_transaction_id INTEGER;                                                                                                                                          +
+   v_after_balance DECIMAL(20, 8);                                                                                                                                    +
+   v_transaction_type VARCHAR(50);                                                                                                                                    +
+ BEGIN                                                                                                                                                                +
+   -- 1. الحصول على التداول المفتوح                                                                                                                                   +
+   SELECT * INTO v_trade                                                                                                                                              +
+   FROM trades                                                                                                                                                        +
+   WHERE id = p_trade_id AND status = 'open'                                                                                                                          +
+   FOR UPDATE;                                                                                                                                                        +
+                                                                                                                                                                      +
+   IF v_trade IS NULL THEN                                                                                                                                            +
+     RAISE EXCEPTION 'Trade not found or not open: %', p_trade_id;                                                                                                    +
+   END IF;                                                                                                                                                            +
+                                                                                                                                                                      +
+   -- 2. الحصول على المحفظة                                                                                                                                           +
+   SELECT id, available_balance                                                                                                                                       +
+   INTO v_wallet_id, v_available_balance                                                                                                                              +
+   FROM wallets                                                                                                                                                       +
+   WHERE id = v_trade.wallet_id                                                                                                                                       +
+   FOR UPDATE;                                                                                                                                                        +
+                                                                                                                                                                      +
+   IF v_wallet_id IS NULL THEN                                                                                                                                        +
+     RAISE EXCEPTION 'Wallet not found for trade %', p_trade_id;                                                                                                      +
+   END IF;                                                                                                                                                            +
+                                                                                                                                                                      +
+   -- 3. حساب الكمية المحجوزة والأرباح/الخسائر                                                                                                                        +
+   v_locked_amount := (v_trade.price::DECIMAL * v_trade.shares::DECIMAL) + COALESCE(v_trade.commission::DECIMAL, 0);                                                  +
+                                                                                                                                                                      +
+   -- حساب الأرباح/الخسائر                                                                                                                                            +
+   IF v_trade.type = 'buy' THEN                                                                                                                                       +
+     v_profit_loss := (p_close_price::DECIMAL - v_trade.price::DECIMAL) * v_trade.shares::DECIMAL;                                                                    +
+   ELSE -- للبيع                                                                                                                                                      +
+     v_profit_loss := (v_trade.price::DECIMAL - p_close_price::DECIMAL) * v_trade.shares::DECIMAL;                                                                    +
+   END IF;                                                                                                                                                            +
+                                                                                                                                                                      +
+   -- 4. تحديث التداول                                                                                                                                                +
+   UPDATE trades                                                                                                                                                      +
+   SET status = 'closed',                                                                                                                                             +
+       close_price = p_close_price,                                                                                                                                   +
+       closed_at = NOW(),                                                                                                                                             +
+       closed_by = p_closed_by,                                                                                                                                       +
+       realized_pnl = v_profit_loss                                                                                                                                   +
+   WHERE id = p_trade_id;                                                                                                                                             +
+                                                                                                                                                                      +
+   -- 5. تحرير الأموال المحجوزة وإضافتها مرة أخرى إلى الرصيد المتاح                                                                                                   +
+   v_after_balance := v_available_balance + v_locked_amount;                                                                                                          +
+                                                                                                                                                                      +
+   UPDATE wallets                                                                                                                                                     +
+   SET available_balance = available_balance + v_locked_amount,                                                                                                       +
+       locked_balance = locked_balance - v_locked_amount,                                                                                                             +
+       updated_at = CURRENT_TIMESTAMP                                                                                                                                 +
+   WHERE id = v_wallet_id;                                                                                                                                            +
+                                                                                                                                                                      +
+   -- 6. إنشاء سجل معاملة لتحرير الأموال                                                                                                                              +
+   INSERT INTO wallet_transactions (                                                                                                                                  +
+     wallet_id,                                                                                                                                                       +
+     transaction_type,                                                                                                                                                +
+     amount,                                                                                                                                                          +
+     before_balance,                                                                                                                                                  +
+     after_balance,                                                                                                                                                   +
+     description,                                                                                                                                                     +
+     reference_id,                                                                                                                                                    +
+     reference_type,                                                                                                                                                  +
+     created_at                                                                                                                                                       +
+   ) VALUES (                                                                                                                                                         +
+     v_wallet_id,                                                                                                                                                     +
+     'trade_close',                                                                                                                                                   +
+     v_locked_amount,                                                                                                                                                 +
+     v_available_balance,                                                                                                                                             +
+     v_after_balance,                                                                                                                                                 +
+     'Original amount returned from trade #' || p_trade_id,                                                                                                           +
+     p_trade_id::VARCHAR,                                                                                                                                             +
+     'trade',                                                                                                                                                         +
+     NOW()                                                                                                                                                            +
+   ) RETURNING id INTO v_transaction_id;                                                                                                                              +
+                                                                                                                                                                      +
+   -- 7. تحديث معرف المعاملة في التداول                                                                                                                               +
+   UPDATE trades                                                                                                                                                      +
+   SET close_transaction_id = v_transaction_id                                                                                                                        +
+   WHERE id = p_trade_id;                                                                                                                                             +
+                                                                                                                                                                      +
+   -- 8. إذا كان هناك ربح أو خسارة، قم بإنشاء معاملة إضافية                                                                                                           +
+   IF v_profit_loss != 0 THEN                                                                                                                                         +
+     IF v_profit_loss > 0 THEN                                                                                                                                        +
+       v_transaction_type := 'trade_profit';                                                                                                                          +
+     ELSE                                                                                                                                                             +
+       v_transaction_type := 'trade_loss';                                                                                                                            +
+     END IF;                                                                                                                                                          +
+                                                                                                                                                                      +
+     -- تحديث الرصيد المتاح بإضافة الربح/الخسارة                                                                                                                      +
+     UPDATE wallets                                                                                                                                                   +
+     SET available_balance = available_balance + v_profit_loss,                                                                                                       +
+         updated_at = CURRENT_TIMESTAMP                                                                                                                               +
+     WHERE id = v_wallet_id;                                                                                                                                          +
+                                                                                                                                                                      +
+     -- إنشاء سجل المعاملة                                                                                                                                            +
+     INSERT INTO wallet_transactions (                                                                                                                                +
+       wallet_id,                                                                                                                                                     +
+       transaction_type,                                                                                                                                              +
+       amount,                                                                                                                                                        +
+       before_balance,                                                                                                                                                +
+       after_balance,                                                                                                                                                 +
+       description,                                                                                                                                                   +
+       reference_id,                                                                                                                                                  +
+       reference_type,                                                                                                                                                +
+       created_at                                                                                                                                                     +
+     ) VALUES (                                                                                                                                                       +
+       v_wallet_id,                                                                                                                                                   +
+       v_transaction_type,                                                                                                                                            +
+       ABS(v_profit_loss),                                                                                                                                            +
+       v_after_balance,                                                                                                                                               +
+       v_after_balance + v_profit_loss,                                                                                                                               +
+       CASE WHEN v_profit_loss > 0                                                                                                                                    +
+            THEN 'Profit from trade #'                                                                                                                                +
+            ELSE 'Loss from trade #'                                                                                                                                  +
+       END || p_trade_id,                                                                                                                                             +
+       p_trade_id::VARCHAR,                                                                                                                                           +
+       'trade',                                                                                                                                                       +
+       NOW()                                                                                                                                                          +
+     );                                                                                                                                                               +
+   END IF;                                                                                                                                                            +
+                                                                                                                                                                      +
+   -- 9. إرجاع التداول المحدث                                                                                                                                         +
+   RETURN (                                                                                                                                                           +
+     SELECT row_to_json(t)                                                                                                                                            +
+     FROM (                                                                                                                                                           +
+       SELECT                                                                                                                                                         +
+         id,                                                                                                                                                          +
+         user_id AS "userId",                                                                                                                                         +
+         symbol,                                                                                                                                                      +
+         type,                                                                                                                                                        +
+         shares,                                                                                                                                                      +
+         price,                                                                                                                                                       +
+         close_price AS "closePrice",                                                                                                                                 +
+         total,                                                                                                                                                       +
+         commission,                                                                                                                                                  +
+         status,                                                                                                                                                      +
+         stop_loss AS "stopLoss",                                                                                                                                     +
+         take_profit AS "takeProfit",                                                                                                                                 +
+         trade_date AS "createdAt",                                                                                                                                   +
+         closed_at AS "closedAt",                                                                                                                                     +
+         closed_by AS "closedBy",                                                                                                                                     +
+         realized_pnl,                                                                                                                                                +
+         wallet_id AS "walletId"                                                                                                                                      +
+       FROM trades                                                                                                                                                    +
+       WHERE id = p_trade_id                                                                                                                                          +
+     ) t                                                                                                                                                              +
+   );                                                                                                                                                                 +
+ END;                                                                                                                                                                 +
+ $function$                                                                                                                                                           +
+ 
+(1 row)
+
